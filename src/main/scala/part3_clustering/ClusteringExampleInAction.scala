@@ -3,9 +3,11 @@ package part3_clustering
 import akka.actor.{Actor, ActorLogging, ActorRef, ActorSystem, Address, Props, ReceiveTimeout}
 import akka.cluster.Cluster
 import akka.cluster.ClusterEvent._
+import akka.dispatch.{PriorityGenerator, UnboundedPriorityMailbox}
 import akka.pattern.pipe
 import akka.util.Timeout
-import com.typesafe.config.ConfigFactory
+import com.typesafe.config.{Config, ConfigFactory}
+import part3_clustering.Master.props
 
 import scala.concurrent.duration._
 import scala.util.Random
@@ -15,6 +17,14 @@ object ClusteringExampleDomain {
   case class ProcessLine(line: String, aggregator: ActorRef)
   case class ProcessLineResult(count: Int)
 }
+
+class ClusterWordCountPriorityMailBox(settings: ActorSystem.Settings, config: Config) extends UnboundedPriorityMailbox(
+  PriorityGenerator {
+    case _: MemberEvent => 0
+    case _ => 4
+  }
+)
+
 
 object Master {
   def props : Props = Props(new Master)
@@ -82,11 +92,15 @@ class Master extends Actor with ActorLogging {
 
       scala.io.Source.fromFile(fileName).getLines().foreach { line =>
         log.info(s"Sending line to process $line current map ${workers.toString()}")
-        val workerIndex = Random.nextInt((workers -- pendingRemoval.keys).size)
-        val worker: ActorRef = (workers -- pendingRemoval.keys).values.toSeq(workerIndex)
+        self ! ProcessLine(line,aggregator)
 
-        worker ! ProcessLine(line, aggregator)
       }
+
+    case ProcessLine(line,aggregator) =>
+      val workerIndex = Random.nextInt((workers -- pendingRemoval.keys).size)
+      val worker: ActorRef = (workers -- pendingRemoval.keys).values.toSeq(workerIndex)
+      worker ! ProcessLine(line, aggregator)
+      Thread.sleep(10)
   }
 
 }
@@ -145,4 +159,16 @@ object SeedNodes extends App {
   Thread.sleep(10000)
   master ! ProcessFile("src/main/resources/txt/lipsum.txt")
 
+}
+
+object AdditionalWorker extends App {
+  val config = ConfigFactory.parseString(
+    s"""
+       |akka.cluster.roles = ["worker"]
+       |akka.remote.artery.canonical.port = 2554
+       """.stripMargin)
+    .withFallback(ConfigFactory.load("part3_clustering/clusteringExample.conf"))
+
+  val system = ActorSystem("RTJVMCluster", config)
+  system.actorOf(Props[Worker], "worker")
 }
