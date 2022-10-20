@@ -1,6 +1,6 @@
 package part3_clustering
 
-import akka.actor.{Actor, ActorLogging, ActorRef, ActorSystem, Address, Props}
+import akka.actor.{Actor, ActorLogging, ActorRef, ActorSystem, Address, Props, ReceiveTimeout}
 import akka.cluster.Cluster
 import akka.cluster.ClusterEvent._
 import akka.pattern.pipe
@@ -8,10 +8,11 @@ import akka.util.Timeout
 import com.typesafe.config.ConfigFactory
 
 import scala.concurrent.duration._
+import scala.util.Random
 
 object ClusteringExampleDomain {
   case class ProcessFile(fileName: String)
-  case class ProcessLine(line: String)
+  case class ProcessLine(line: String, aggregator: ActorRef)
   case class ProcessLineResult(count: Int)
 }
 
@@ -39,7 +40,9 @@ class Master extends Actor with ActorLogging {
   }
   override def postStop(): Unit = cluster.unsubscribe(self)
 
-  override def receive: Receive = handleClusterEvents.orElse(handleWorkerRegistration)
+  override def receive: Receive = handleClusterEvents
+    .orElse(handleWorkerRegistration)
+    .orElse(handleJob)
 
   def handleClusterEvents: Receive = {
     case MemberUp(member) if member.hasRole("worker") =>
@@ -72,15 +75,54 @@ class Master extends Actor with ActorLogging {
       workers = workers + pair
   }
 
+  def handleJob: Receive = {
+    case ProcessFile(fileName) =>
+      log.info("Starting processing of file at Master")
+      val aggregator = context.actorOf(Aggregator.props,"aggregator")
+
+      scala.io.Source.fromFile(fileName).getLines().foreach { line =>
+        log.info(s"Sending line to process $line current map ${workers.toString()}")
+        val workerIndex = Random.nextInt((workers -- pendingRemoval.keys).size)
+        val worker: ActorRef = (workers -- pendingRemoval.keys).values.toSeq(workerIndex)
+
+        worker ! ProcessLine(line, aggregator)
+      }
+  }
+
 }
 object Worker {
   def props : Props = Props(new Worker)
 }
 class Worker extends Actor with ActorLogging {
+
+  import ClusteringExampleDomain._
+
   override def receive: Receive = {
-    case _ => log.info("Worker succesfully registered")
+    case ProcessLine(line,aggregator) =>
+      log.info(s"Processing line $line on worker ${self.path}")
+      aggregator ! ProcessLineResult(line.split(" ").length)
   }
 }
+
+object Aggregator {
+  def props: Props = Props(new Aggregator)
+}
+class Aggregator extends Actor with ActorLogging {
+  import ClusteringExampleDomain._
+  context.setReceiveTimeout(10 seconds)
+
+  override def receive: Receive = online(0)
+
+  def online(totalCount: Int): Receive = {
+    case ProcessLineResult(count) =>
+      log.info("Increasing word count")
+      context.become(online(totalCount+count))
+    case ReceiveTimeout =>
+      log.info(s"TOTAL COUNT: $totalCount")
+      context.setReceiveTimeout(Duration.Undefined)
+  }
+}
+
 
 object SeedNodes extends App {
 
@@ -95,8 +137,12 @@ object SeedNodes extends App {
     val system = ActorSystem("RTJVMCluster", config)
     system.actorOf(props, actorName)
   }
-  createNode(2551,"master",Master.props,"master")
-  createNode(2552,"worker",Master.props,"worker")
-  createNode(2553,"worker",Master.props,"worker")
+  val master = createNode(2551,"master",Master.props,"master")
+  createNode(2552,"worker",Worker.props,"worker")
+  createNode(2553,"worker",Worker.props,"worker")
+
+  import ClusteringExampleDomain._
+  Thread.sleep(10000)
+  master ! ProcessFile("src/main/resources/txt/lipsum.txt")
 
 }
